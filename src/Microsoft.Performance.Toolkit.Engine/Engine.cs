@@ -1,4 +1,4 @@
-// Copyright (c) Microsoft Corporation.
+﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 using System;
@@ -17,6 +17,7 @@ using Microsoft.Performance.SDK.Runtime.DTO;
 using Microsoft.Performance.SDK.Runtime.Extensibility;
 using Microsoft.Performance.SDK.Runtime.Extensibility.DataExtensions;
 using Microsoft.Performance.SDK.Runtime.Extensibility.DataExtensions.Repository;
+using Microsoft.Performance.SDK.Runtime.Extensibility.DataExtensions.Tables;
 
 namespace Microsoft.Performance.Toolkit.Engine
 {
@@ -36,7 +37,8 @@ namespace Microsoft.Performance.Toolkit.Engine
         private readonly ReadOnlyCollection<DataCookerPath> compositeDataCookersRO;
 
         private readonly Dictionary<Guid, TableDescriptor> tableGuidToDescriptor;
-        private readonly List<Guid> allTables;
+        private readonly List<TableDescriptor> allTables;
+        private readonly ReadOnlyCollection<TableDescriptor> allTablesRO;
 
         private readonly List<DataProcessorId> dataProcessors;
 
@@ -47,6 +49,10 @@ namespace Microsoft.Performance.Toolkit.Engine
 
         private readonly List<DataCookerPath> enabledCookers;
         private readonly ReadOnlyCollection<DataCookerPath> enabledCookersRO;
+
+        // TRGIBEAU: Maybe make this a hashset?
+        private readonly List<TableDescriptor> enabledTables;
+        private readonly ReadOnlyCollection<TableDescriptor> enabledTablesRO;
 
         private IDataExtensionRepositoryBuilder repository;
         private DataExtensionFactory factory;
@@ -66,7 +72,8 @@ namespace Microsoft.Performance.Toolkit.Engine
             this.compositeDataCookersRO = new ReadOnlyCollection<DataCookerPath>(this.compositeDataCookers);
 
             this.tableGuidToDescriptor = new Dictionary<Guid, TableDescriptor>();
-            this.allTables = new List<Guid>();
+            this.allTables = new List<TableDescriptor>();
+            this.allTablesRO = new ReadOnlyCollection<TableDescriptor>(this.allTables);
 
             this.dataProcessors = new List<DataProcessorId>();
 
@@ -77,6 +84,9 @@ namespace Microsoft.Performance.Toolkit.Engine
 
             this.enabledCookers = new List<DataCookerPath>();
             this.enabledCookersRO = new ReadOnlyCollection<DataCookerPath>(this.enabledCookers);
+
+            this.enabledTables = new List<TableDescriptor>();
+            this.enabledTablesRO = new ReadOnlyCollection<TableDescriptor>(this.enabledTables);
         }
 
         /// <summary>
@@ -134,6 +144,16 @@ namespace Microsoft.Performance.Toolkit.Engine
         ///     Gets the collection of all cookers
         /// </summary>
         public IEnumerable<DataCookerPath> EnabledCookers => this.enabledCookersRO;
+
+        /// <summary>
+        ///     Gets the collection of all enabled tables
+        /// </summary>
+        public IEnumerable<TableDescriptor> EnableTables => this.enabledTablesRO;
+
+        /// <summary>
+        ///     Gets the collection of available tables
+        /// </summary>
+        public IEnumerable<TableDescriptor> AllTables => this.allTablesRO;
 
         /// <summary>
         ///     Creates a new instance of the <see cref="Engine" /> class.
@@ -515,6 +535,38 @@ namespace Microsoft.Performance.Toolkit.Engine
             return true;
         }
 
+        public void EnableCooker(TableDescriptor descriptor)
+        {
+            this.ThrowIfProcessed();
+
+            if (!this.TryEnableTable(descriptor))
+            {
+                // TRGIBEAU: Create better exception
+                throw new Exception($"Table not found: {descriptor}");
+            }
+        }
+
+        public bool TryEnableTable(TableDescriptor descriptor)
+        {
+            if (this.IsProcessed)
+            {
+                return false;
+            }
+
+            if (!this.allTables.Contains(descriptor))
+            {
+                return false;
+            }
+
+            if (this.enabledTables.Contains(descriptor))
+            {
+                return true;
+            }
+
+            this.enabledTables.Add(descriptor);
+            return true;
+        }
+
         /// <summary>
         ///     Processes all of the files given to this instance using all
         ///     of the enabled cookers.
@@ -576,15 +628,17 @@ namespace Microsoft.Performance.Toolkit.Engine
             instance.sourceDataCookers.AddRange(repoTuple.Item2.SourceDataCookers);
             instance.compositeDataCookers.AddRange(repoTuple.Item2.CompositeDataCookers);
 
-            var allTables = new HashSet<Guid>();
+            // TRGIBEAU: Do we need anything else off of the Reference?
+            var allTables = new HashSet<TableDescriptor>();
             foreach (var tableId in repoTuple.Item2.TablesById)
             {
-                allTables.Add(tableId.Key);
+                allTables.Add(tableId.Value.TableDescriptor);
+                instance.tableGuidToDescriptor[tableId.Key] = tableId.Value.TableDescriptor;
             }
 
             foreach (var descriptor in catalog.PlugIns.SelectMany(x => x.AvailableTables))
             {
-                allTables.Add(descriptor.Guid);
+                allTables.Add(descriptor);
                 instance.tableGuidToDescriptor[descriptor.Guid] = descriptor;
             }
 
@@ -640,9 +694,34 @@ namespace Microsoft.Performance.Toolkit.Engine
                 this.FilesToProcess);
 
             var executors = CreateExecutors(allFileAssociations);
+
+            var extendedTables = new HashSet<ITableExtensionReference>();
+
+            foreach (var table in this.enabledTables)
+            {
+                foreach (var executor in executors.Where(x => x.Context.CustomDataSource.DataTables.Contains(table)))
+                {
+                    executor.Processor.EnableTable(table);
+                }
+
+                if (this.repository.TablesById.TryGetValue(table.Guid, out ITableExtensionReference reference))
+                {
+                    extendedTables.Add(reference);
+                }
+
+            }
+
+
             var processors = this.repository.EnableDataCookers(
                 executors.Select(x => x.Processor as ICustomDataProcessorWithSourceParser).Where(x => !(x is null)),
                 new HashSet<DataCookerPath>(this.enabledCookers));
+
+
+            var processorForTable = this.repository.EnableSourceDataCookersForTables(
+                executors.Select(x => x.Processor as ICustomDataProcessorWithSourceParser).Where(x => !(x is null)),
+                extendedTables);
+
+            processors.UnionWith(processorForTable);
 
             var executionResults = new List<ExecutionResult>(executors.Count);
             foreach (var executor in executors)
@@ -671,7 +750,8 @@ namespace Microsoft.Performance.Toolkit.Engine
             var results = new RuntimeExecutionResults(
                 retrieval,
                 retrievalFactory,
-                this.repository);
+                this.repository,
+                executors);
 
             return results;
         }
